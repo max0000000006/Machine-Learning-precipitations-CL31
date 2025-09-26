@@ -1,0 +1,252 @@
+import numpy as np
+from joblib import dump, load
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay, roc_auc_score
+import matplotlib.pyplot as plt
+import os
+import xarray as xr
+from netCDF4 import Dataset
+from scipy.signal import firwin, lfilter, freqz, filtfilt
+from fastai.tabular.all import *
+from fastai.vision.all import *
+import datetime
+
+
+
+
+
+
+# Initialize all the path to the NetCDF files
+base_path_CL = f"C:\\Users\\maxco\\OneDrive\\Bureau\\STAGE_IPSL\\data\\2024\\2024_CL\\"
+base_path_MRR = f"C:\\Users\\maxco\\OneDrive\\Bureau\\STAGE_IPSL\\data\\2024\\2024_MRR\\"
+List_month_CL = ['202401','202402','202403','202404','202405','202406','202407','202408','202409','202410','202411','202412']
+List_month_MRR = ['Mk_processed202401','Mk_processed202402','Mk_processed202403','Mk_processed202404','Mk_processed202405','Mk_processed202406','Mk_processed202407','Mk_processed202408','Mk_processed202409','Mk_processed202410','Mk_processed202411','Mk_processed202412']
+incomplete_months = ['Mk_processed202404','Mk_processed202405','Mk_processed202406','Mk_processed202407','Mk_processed202408','Mk_processed202409','Mk_processed202410']
+#path_CLt = f"C:\\Users\\maxco\\OneDrive\\Bureau\\STAGE_IPSL\\data\\training_data_ML\\202112_CL31\\"
+#path_MRRt = f"C:\\Users\\maxco\\OneDrive\\Bureau\\STAGE_IPSL\\data\\training_data_ML\\202112_MRR\\"
+# CEILO Pretreatment
+
+CEILO = None  # Initialize CEILO as None to concatenate later
+k= 0
+for month in List_month_CL:
+    k+= 1
+    month_dir = os.path.join(base_path_CL, month)
+    if not os.path.exists(month_dir):
+        print(f"⚠️ Dossier non trouvé : {month_dir}")
+        continue
+    nc_files = sorted([f for f in os.listdir(month_dir) if f.endswith('.nc')])
+    for file in nc_files:
+        file_path = os.path.join(month_dir, file)
+        try:
+            with Dataset(file_path, 'r') as ds:
+                wt = ds.variables['window_transmission'][:]
+                vv = ds.variables['vertical_visibility'][:]
+                beta_raw = ds.variables['rcs_0'][:, 30:50]
+                times_raw = ds.variables['time'][:]
+                n = np.shape(beta_raw)[0]
+                m = [k] * n
+                if CEILO is None:
+                    CEILO = beta_raw
+                    all_times = times_raw
+                    vertical_vis = vv
+                    window_trans = wt
+                    month_l = m
+                else:
+                    CEILO = np.concatenate((CEILO, beta_raw), axis=0)
+                    all_times = np.concatenate((all_times, times_raw), axis=0)
+                    vertical_vis = np.concatenate((vertical_vis,vv),axis = 0)
+                    window_trans = np.concatenate((window_trans,wt),axis=0)
+                    month_l = np.concatenate((month_l,m),axis=0)
+        except Exception as e:
+            print(f"❌ Erreur avec {file_path} : {e}")
+
+#Initialize MRR
+
+MRR = None
+Z = np.zeros((58,2))
+for month in List_month_MRR:
+    month_dir = os.path.join(base_path_MRR, month)
+    if not os.path.exists(month_dir):
+        print(f"⚠️ Dossier non trouvé : {month_dir}")
+        continue
+
+    nc_files = sorted([f for f in os.listdir(month_dir) if f.endswith('.nc')])
+    for file in nc_files:
+        file_path = os.path.join(month_dir, file)
+        try:
+            with Dataset(file_path, 'r') as ds:
+                snowfall_rate = ds.variables['SnowfallRate'][:, 2:4]  # (T, 1)
+                # Ajout conditionnel du vecteur Z si le mois est incomplet
+                if month in incomplete_months:
+                    snowfall_rate = np.vstack([snowfall_rate, Z])
+
+                if MRR is None:
+                    MRR = snowfall_rate
+                else:
+                    MRR = np.concatenate((MRR, snowfall_rate), axis=0)
+        except Exception as e:
+            print(f"❌ Erreur avec {file_path} : {e}")
+
+
+
+
+
+#Creating CEILO_mean to smooth the data of CEIL and get the same resolution as the MRR
+CEILO_mean = np.zeros((np.shape(CEILO)[0]//2,np.shape(CEILO)[1]))
+for i in range(np.shape(CEILO_mean)[0]):
+    CEILO_mean[i,:] = (CEILO[2*i,:] + CEILO[2*i+1,:])/2
+
+
+M = CEILO_mean
+
+q1, q3 = np.percentile(M, [25, 75], axis=0)
+iqr = q3 - q1
+lower_bound = q1 - 1.5 * iqr
+upper_bound = q3 + 1.5 * iqr
+M = np.clip(M, lower_bound, upper_bound)
+
+
+fs = 1e6
+order = 50
+cutoff = 1e2
+
+fir_coeff = firwin(numtaps=order + 1, cutoff=cutoff, window='hamming', fs = fs) 
+
+M_filtered = np.zeros_like(M)
+for i in range(M.shape[1]):
+    if M.shape[0] > 3 * len(fir_coeff):  # Vérifie que longueur est suffisante
+        M_filtered[:, i] = filtfilt(fir_coeff, [1.0], M[:, i])
+    else:
+        raise ValueError("Signal trop court pour filtrer avec filtfilt.")
+M=M_filtered
+
+print(np.shape(MRR))
+print(np.shape(CEILO_mean))
+
+
+
+def make_vertical_windows(X,Y):
+    a,b = X.shape # données du CEILO
+    c,d = Y.shape # données du MRR
+    if a != c:
+        raise ValueError("Les dimensions des données CEILO et MRR ne correspondent pas.")
+    if b % 10 != 0:
+        raise ValueError("Le nombre de colonnes dans les données CEILO doit être un multiple de 10 pour créer des fenêtres verticales de 10.")
+    num_windows = b // 10
+    X_windows = np.zeros((a, num_windows, 10))  # Initialiser    
+    for i in range(num_windows):
+        X_windows[:, i, :] = X[:, i*10:(i+1)*10]  # Extraire les fenêtres de 10 colonnes
+    return X_windows
+
+M = make_vertical_windows(M, MRR)
+M = M.reshape(-1,10)
+
+LABELS = np.zeros_like(MRR , dtype=int)  # Initialize LABELS with zeros
+for k in range (np.shape(MRR)[0]):
+    for j in range(np.shape(MRR)[1]):
+        if (MRR[k,j])<=0:
+            LABELS[k,j] = 0
+        else:
+            LABELS[k,j] = 1
+
+
+
+
+LABELS = LABELS.reshape(-1)
+compteur = 0
+compteur_2 = 0
+for k in range(np.shape(LABELS)[0]):
+    if LABELS[k] == 1:
+        compteur += 1
+prop = compteur / np.shape(LABELS)[0]
+print(f"Proportion de précipitation : {prop:.2f}")
+
+
+Seuil = np.shape(LABELS)[0] - 2*compteur
+L= np.zeros((np.shape(M)[0]))
+for k in range(np.shape(LABELS)[0]-1,-1,-1):
+    if LABELS[k] == 0:
+        L[compteur_2] = k
+        compteur_2 += 1
+        if compteur_2 > Seuil:
+            break
+
+    
+M = np.delete(M, L.astype(int), axis=0)
+LABELS = np.delete(LABELS, L.astype(int), axis=0)
+print(np.shape(M))
+print(np.shape(LABELS))
+prop = compteur / np.shape(LABELS)[0]
+print(f"Proportion de précipitation : {prop:.2f}")
+
+
+LABELS = LABELS.flatten()
+
+
+
+# Assuming M is your data array with shape (n_samples, n_heights)
+FEATURES = np.zeros((M.shape[0], 7))  # Adjust for new features
+
+for k in range(M.shape[0]):
+    profile = M[k, :]
+    
+    # Existing features
+    FEATURES[k, 0] = np.sqrt(np.sum(profile ** 2))  # Signal energy
+    FEATURES[k, 1] = scipy.stats.skew(profile, nan_policy='omit')
+    FEATURES[k, 2] = np.corrcoef(profile[:-1], profile[1:])[0, 1] if len(profile) > 1 else 0
+    x = np.arange(len(profile))
+    slope, _ = np.polyfit(x, profile, 1)
+    FEATURES[k, 3] = slope
+    FEATURES[k, 4] = np.min(profile)
+    FEATURES[k, 5] = np.max(profile)
+    
+    # New features
+
+    FEATURES[k, 6] = np.mean(np.diff(profile))  # Average vertical gradient
+
+Class = load_learner("classifier.pkl")
+Class.metrics = []
+
+X_train, X_test, y_train, y_test = train_test_split(FEATURES, LABELS, test_size=0.3, random_state=42)
+
+df = pd.DataFrame(X_train, columns=[f'f{i}' for i in range(X_train.shape[1])])
+df['label'] = y_train
+
+dls = TabularDataLoaders.from_df(
+    df,
+    procs=[Normalize],                 # normalisation
+    cont_names=[f'f{i}' for i in range(X_train.shape[1])],  # colonnes numériques
+    y_names='label',                   # colonne de la cible
+    y_block=CategoryBlock(),           # classification
+    bs=64
+)
+
+learn = tabular_learner(
+    dls,
+    layers=[200,100,50],   # réseau MLP 200 → 100 → sortie
+    metrics=accuracy
+)
+
+learn.fit_one_cycle(100)   # 5 epochs
+
+learn.show_results()    # montre quelques exemples
+
+row = df.iloc[0]        # un exemple
+print(learn.predict(row))   # prédiction binaire (0 ou 1)
+interp = ClassificationInterpretation.from_learner(learn)
+interp.plot_confusion_matrix()
+
+preds, targs = learn.get_preds()
+y_pred = preds.argmax(dim=1)   # classes prédites (0/1)
+y_true = targs
+
+cm = confusion_matrix(y_true, y_pred)
+disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+disp.plot(cmap='Blues')
+plt.show()
+
+learn.export("classifier.pkl")
+
+
