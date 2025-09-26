@@ -1,0 +1,26 @@
+from fastai.vision.all import *
+from sklearn.ensemble import GradientBoostingClassifier
+from joblib import dump, load
+from netCDF4 import Dataset
+from scipy.signal import firwin, lfilter, freqz, filtfilt
+import matplotlib.pyplot as plt
+from matplotlib import colors
+import numpy as np
+import datetime
+import pandas as pd
+
+base_path_MRR = f"C:\\Users\\maxco\\OneDrive\\Bureau\\STAGE_IPSL\\netcdf_complete\\2024\\202401_completed\\20240126_60s_MK_Ze-corrected_S-included_completed.nc"
+
+src = Dataset(base_path_MRR,"r")
+
+
+
+MRR = src.variables['SnowfallRate'][:]
+MRR = MRR.transpose()
+
+cmap = colors.LinearSegmentedColormap.from_list("blue_cyan", [(0.0, "blue"), (1.0, "cyan")], N=256)
+
+plt.figure(figsize=(14, 6))
+im = plt.imshow(MRR, cmap=cmap, aspect="auto",interpolation='nearest',origin ='lower', extent=[0, MRR.shape[1], 0, MRR.shape[0]])
+plt.colorbar(im,extend ='max', label='Snowfall Rate (mm/h)')
+plt.show()

@@ -1,0 +1,178 @@
+from fastai.vision.all import *
+from sklearn.ensemble import GradientBoostingClassifier
+from joblib import dump, load
+from netCDF4 import Dataset
+from scipy.signal import firwin, lfilter, freqz, filtfilt
+import matplotlib.pyplot as plt
+from matplotlib import colors
+import numpy as np
+import datetime
+import pandas as pd
+
+
+
+ncfile = Dataset("20221230_completed.nc", mode="w", format="NETCDF4")
+#Charger les modèles
+Estim = load_learner("model.pkl")
+Estim.metrics = []
+Class = load_learner("classifier.pkl")
+Class.metrics = []
+
+
+base_path_CL = f"C:\\Users\\maxco\\OneDrive\\Bureau\\STAGE_IPSL\\data\\training_data_ML\\202212_CL31\\CALVA_CL31_20221230.nc"
+base_path_MRR = f"C:\\Users\\maxco\\OneDrive\\Bureau\\STAGE_IPSL\\data\\training_data_ML\\202212_MRR\\20221230_60s_MK_Ze-corrected_S-included.nc"
+
+src = Dataset(base_path_MRR,"r")
+ds = Dataset(base_path_CL, 'r')
+
+print(src.variables.keys())
+print(ds.filepath())   # chemin complet du fichier
+print(ds.filepath().split("\\")[-1])  # juste le nom
+CEILO = None
+CEILO = ds.variables['rcs_0'][:]
+
+MRR = None
+MRR = src.variables['SnowfallRate'][:]
+
+print(CEILO.shape)
+print(MRR.shape)
+CEILO_mean = np.zeros((np.shape(CEILO)[0]//2,np.shape(CEILO)[1]))
+for i in range(np.shape(CEILO_mean)[0]):
+    CEILO_mean[i,:] = (CEILO[2*i,:] + CEILO[2*i+1,:])/2
+
+def make_vertical_windows(X):
+    a,b = X.shape # données du CEILO
+    num_windows = b // 10
+    X_windows = np.zeros((a, num_windows, 10))  # Initialiser    
+    for i in range(num_windows):
+        X_windows[:, i, :] = X[:, i*10:(i+1)*10]  # Extraire les fenêtres de 10 colonnes
+    return X_windows
+
+
+
+M = CEILO_mean
+
+fs = 1e6
+order = 50
+cutoff = 1e2
+
+q1, q3 = np.percentile(M, [25, 75], axis=0)
+iqr = q3 - q1
+lower_bound = q1 - 1.5 * iqr
+upper_bound = q3 + 1.5 * iqr
+M = np.clip(M, lower_bound, upper_bound)
+
+fir_coeff = firwin(numtaps=order + 1, cutoff=cutoff, window='hamming', fs = fs) 
+
+M_filtered = np.zeros_like(M)
+for i in range(M.shape[1]):
+    if M.shape[0] > 3 * len(fir_coeff):  # Vérifie que longueur est suffisante
+        M_filtered[:, i] = filtfilt(fir_coeff, [1.0], M[:, i])
+    else:
+        raise ValueError("Signal trop court pour filtrer avec filtfilt.")
+M=M_filtered
+
+M = M[:,:30]
+M = make_vertical_windows(M)
+
+
+def features_extraction(M):
+    FEATURES = np.zeros((M.shape[0], M.shape[1],7))  # Adjust for new features
+
+    for k in range(M.shape[0]):
+        for i in range(M.shape[1]):
+            profile = M[k,i, :]
+    
+    # Existing features
+            FEATURES[k,i, 0] = np.sqrt(np.sum(profile ** 2))  # Signal energy
+            FEATURES[k,i, 1] = scipy.stats.skew(profile, nan_policy='omit')
+            FEATURES[k,i, 2] = np.corrcoef(profile[:-1], profile[1:])[0, 1] if len(profile) > 1 else 0
+            x = np.arange(len(profile))
+            slope, _ = np.polyfit(x, profile, 1)
+            FEATURES[k,i, 3] = slope
+            FEATURES[k,i, 4] = np.min(profile)
+            FEATURES[k,i, 5] = np.max(profile)
+            FEATURES[k,i, 6] = np.mean(np.diff(profile))  # Average vertical gradient
+    return FEATURES
+
+FEATURES = features_extraction(M)
+
+
+
+def fastai_predict_row(learner, window):
+    # construire un DataFrame avec les bons noms de colonnes
+    df = pd.DataFrame([window], columns=learner.dls.cont_names)
+    dl = learner.dls.test_dl(df)
+    preds, _ = learner.get_preds(dl=dl)   # retourne un tensor
+    return preds[0].item()                # un float Python
+
+def fastai_predict_class(learner, window):
+    df = pd.DataFrame([window], columns=learner.dls.cont_names)
+    dl = learner.dls.test_dl(df)
+    preds, _ = learner.get_preds(dl=dl)  # tensor de shape (1,2)
+    pred_class = preds.argmax(dim=1)     # argmax donne 0 ou 1
+    return int(pred_class.item())
+
+
+
+print(np.shape(FEATURES))
+def complete_MRR(FEATURES, MRR):
+    a,b,c = FEATURES.shape
+    MRR_completed = MRR.copy()
+    Nan_vector = np.full((a,1),np.nan)
+    MRR_completed = np.concatenate((Nan_vector,MRR_completed),axis=1)
+    for i in range(a):
+        for j in range(b):
+            window = FEATURES[i,j,:].flatten()
+            
+            # prédiction classification scikit-learn
+            pred_class = fastai_predict_class(Class, window)
+            if pred_class == 0:
+                MRR_completed[i,j] = np.nan
+            else:
+                pred_value = fastai_predict_row(Estim, window)
+                MRR_completed[i,j] = pred_value
+    for i in range(np.shape(MRR_completed)[0]):
+        for j in range(np.shape(MRR_completed)[1]):
+            if MRR_completed[i,j] < 0:
+                MRR_completed[i,j] = np.nan
+    return MRR_completed
+
+
+
+
+MRR_completed = complete_MRR(FEATURES=FEATURES, MRR=MRR)
+
+MRR_completed = np.transpose(MRR_completed)
+MRR = np.transpose(MRR)
+cmap = colors.LinearSegmentedColormap.from_list("blue_cyan", [(0.0, "blue"), (1.0, "cyan")], N=256)
+
+plt.figure(figsize=(14, 6))
+im = plt.imshow(MRR_completed, cmap=cmap, aspect="auto",interpolation='nearest',origin ='lower', extent=[0, MRR_completed.shape[1], 0, MRR_completed.shape[0]])
+plt.colorbar(im,extend ='max', label='Snowfall Rate (mm/h)')
+plt.show()
+
+for name, dimension in src.dimensions.items():
+    ncfile.createDimension(
+        name,
+        (len(dimension) if not dimension.isunlimited() else None)
+    )
+
+for name, variable in src.variables.items():
+    new_var = ncfile.createVariable(name, variable.datatype, variable.dimensions)
+    
+    # Copier les attributs de la variable
+    new_var.setncatts({k: variable.getncattr(k) for k in variable.ncattrs()})
+    
+    # Copier les données
+    data = variable[:]
+
+    if name == 'SnowfallRate':
+        data = MRR_completed
+
+ncfile.setncatts({k: src.getncattr(k) for k in src.ncattrs()})
+
+ncfile.close()
+src.close()
+ds.close()
+
